@@ -1,6 +1,19 @@
 /* 医保合规证据复核台：原生 JS，无外部依赖。 */
 (function () {
   "use strict";
+  // 全局错误提示：便于排查「点击无反应」等异常
+  window.onerror = function (msg, src, line, col, err) {
+    try {
+      var t = document.getElementById("toast");
+      if (t) {
+        t.textContent = "页面脚本错误：" + (msg || (err && err.message) || "未知错误") + (line ? "（第 " + line + " 行）" : "");
+        t.classList.add("show");
+        clearTimeout(t._timer);
+        t._timer = setTimeout(function () { t.classList.remove("show"); }, 6000);
+      }
+    } catch (e) {}
+    return false;
+  };
   var DATA = null, curPatient = null, curBillIdx = null;
   var curDrawer = { billIdx: null, eviIdx: null, docId: null, evidences: [], docEvs: [] };
   var edits = {};                     // patientId -> { docId: true } 记录未确认保存的修改
