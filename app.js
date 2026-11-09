@@ -3,12 +3,18 @@
   "use strict";
   var DATA = null, curPatient = null, curBillIdx = null;
   var curDrawer = { billIdx: null, eviIdx: null, docId: null, evidences: [], docEvs: [] };
+  var edits = {};                     // patientId -> { docId: true } 记录未确认保存的修改
+  var editState = { editing: false }; // 文书是否处于编辑态
   var $ = function (id) { return document.getElementById(id); };
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
       return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c];
     });
+  }
+  function truncate(s, n) {
+    s = String(s == null ? "" : s);
+    return s.length > n ? s.slice(0, n) + "…" : s;
   }
   function money(n) { return "￥" + Number(n || 0).toFixed(2); }
   function silverChip(s, adjusted) {
@@ -255,6 +261,11 @@
   function closeDrawer() {
     $("drawer").classList.add("hidden");
     $("drawer-backdrop").classList.add("hidden");
+    if (editState.editing) {
+      editState.editing = false;
+      var eb = $("edit-toggle");
+      if (eb) { eb.textContent = "编辑"; eb.classList.remove("active"); }
+    }
   }
   function switchTab(tab) {
     var evidence = tab === "evidence";
@@ -265,9 +276,17 @@
   }
 
   function renderDrawerCase(b) {
-    $("drawer-case").innerHTML = '<div class="drawer-case-label">当前审核项目</div><div class="drawer-case-main"><b>' + esc(b.item) + '</b><span>' + money(b.amount) + '</span>' + silverChip(b.silver_status) + '</div>' +
-      '<div class="drawer-case-clause"><span>银海条款</span>' + esc(b.clause || "—") + '</div>';
-    $("drawer-basis").innerHTML = basisInline(b.ai);
+    var r = primaryReference(b.ai);
+    var basisHtml = r
+      ? '<div class="drawer-case-basis" data-open-ref title="点击查看完整审核依据"><span>对应依据</span>' + esc(r.type) + '：' + esc(truncate(r.clause, 46)) + '</div>'
+      : '';
+    $("drawer-case").innerHTML =
+      '<div class="drawer-case-main"><b>' + esc(b.item) + '</b><span>' + money(b.amount) + '</span>' + silverChip(b.silver_status) + '</div>' +
+      '<div class="drawer-case-clause"><span>银海条款</span>' + esc(b.clause || "—") + '</div>' + basisHtml;
+    var ref = $("drawer-case").querySelector("[data-open-ref]");
+    if (ref) ref.onclick = function () { openReferences(curBillIdx); };
+    renderSuggestions(b);
+    updateSaveBar();
   }
 
   function openEvidence(billIdx, eviIdx) {
@@ -326,19 +345,43 @@
         if (ev.line_no === ln.no) marks.push({start: ev.char_start, end: ev.char_end, index: i, quote: ev.quote});
       });
       marks.sort(function (a, b) { return a.start - b.start; });
-      var text = ln.text, pos = 0, rendered = "";
-      marks.forEach(function (m) {
-        if (m.start < pos || text.slice(m.start, m.end) !== m.quote) return;
-        rendered += esc(text.slice(pos, m.start)) + '<mark data-local="' + m.index + '">' + esc(text.slice(m.start, m.end)) + '</mark>';
-        pos = m.end;
-      });
-      rendered += esc(text.slice(pos));
-      html += '<div class="doc-line"><span class="doc-no">' + ln.no + '</span><span class="doc-text">' + rendered + '</span></div>';
+      var hasIssue = marks.length > 0;
+      if (editState.editing) {
+        html += '<div class="doc-line' + (hasIssue ? ' has-evidence' : '') + '" data-no="' + ln.no + '">' +
+          '<span class="doc-no">' + ln.no + '</span><span class="doc-text" contenteditable="true">' + esc(ln.text) + '</span></div>';
+      } else {
+        var text = ln.text, pos = 0, rendered = "";
+        marks.forEach(function (m) {
+          if (m.start < pos || text.slice(m.start, m.end) !== m.quote) return;
+          rendered += esc(text.slice(pos, m.start)) + '<mark data-local="' + m.index + '">' + esc(text.slice(m.start, m.end)) + '</mark>';
+          pos = m.end;
+        });
+        rendered += esc(text.slice(pos));
+        html += '<div class="doc-line" data-no="' + ln.no + '"><span class="doc-no">' + ln.no + '</span><span class="doc-text">' + rendered + '</span></div>';
+      }
     });
     $("drawer-doc").innerHTML = html;
     document.querySelectorAll("[data-anchor]").forEach(function (el) {
-      el.onclick = function () { jumpTo(+el.getAttribute("data-anchor")); };
+      el.onclick = function () {
+        var i = +el.getAttribute("data-anchor");
+        if (editState.editing) {
+          var ev = docEvs[i];
+          var lineEl = document.querySelector('#drawer-doc .doc-line[data-no="' + ev.line_no + '"]');
+          if (lineEl) lineEl.scrollIntoView({behavior: "smooth", block: "center"});
+        } else {
+          jumpTo(i);
+        }
+      };
     });
+    if (editState.editing) {
+      document.querySelectorAll("#drawer-doc .doc-text[contenteditable]").forEach(function (el) {
+        el.addEventListener("input", function () {
+          var no = +el.closest(".doc-line").getAttribute("data-no");
+          d.lines.forEach(function (l) { if (l.no === no) l.text = el.textContent; });
+          markDirty(curPatient.id, curDrawer.docId);
+        });
+      });
+    }
     if (scrollToEvidence && curDrawer.eviIdx != null) {
       var target = curDrawer.evidences[curDrawer.eviIdx], local = -1;
       docEvs.forEach(function (ev, i) {
@@ -376,9 +419,166 @@
     $("reference-list").innerHTML = html;
   }
 
+  // ===== AI 修改建议 + 编辑保存 =====
+  function showToast(msg) {
+    var t = $("toast");
+    if (!t) return;
+    t.textContent = msg;
+    t.classList.add("show");
+    clearTimeout(t._timer);
+    t._timer = setTimeout(function () { t.classList.remove("show"); }, 2400);
+  }
+
+  function copyText(text, btn) {
+    function done() {
+      showToast("已复制建议到剪贴板");
+      if (btn) {
+        var old = btn.textContent;
+        btn.textContent = "已复制";
+        setTimeout(function () { btn.textContent = old; }, 1600);
+      }
+    }
+    function fallback() {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      try { document.execCommand("copy"); done(); } catch (e) { showToast("复制失败，请手动选择复制"); }
+      document.body.removeChild(ta);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  function markDirty(pid, docId) {
+    if (!edits[pid]) edits[pid] = {};
+    edits[pid][docId] = true;
+    updateSaveBar();
+  }
+
+  function updateSaveBar() {
+    var btn = $("save-btn"), hint = $("save-hint");
+    if (!btn) return;
+    var map = edits[curPatient.id] || {};
+    var dirty = Object.keys(map).filter(function (k) { return map[k]; });
+    if (dirty.length) {
+      btn.disabled = false;
+      hint.textContent = "已修改 " + dirty.length + " 份文书，请人工确认后保存";
+    } else {
+      btn.disabled = true;
+      hint.textContent = "尚未修改";
+    }
+  }
+
+  function saveEdits() {
+    var map = edits[curPatient.id] || {};
+    var dirty = Object.keys(map).filter(function (k) { return map[k]; });
+    if (!dirty.length) { showToast("暂无需要保存的修改"); return; }
+    var names = dirty.map(function (did) {
+      return curPatient.emr[did] ? curPatient.emr[did].type : did;
+    });
+    edits[curPatient.id] = {};
+    updateSaveBar();
+    showToast("修改成功：已写回原始《" + names.join("》《") + "》");
+  }
+
+  function renderSuggestions(b) {
+    var panel = $("suggestion-panel");
+    if (!panel) return;
+    var sgs = (b.ai && b.ai.suggestions) || [];
+    if (!sgs.length) {
+      panel.classList.add("hidden");
+      if ($("sg-open-btn")) $("sg-open-btn").classList.add("hidden");
+      return;
+    }
+    panel.classList.remove("hidden");
+    panel.classList.remove("collapsed");
+    if ($("sg-open-btn")) $("sg-open-btn").classList.add("hidden");
+    if ($("sg-count")) $("sg-count").textContent = sgs.length;
+    var body = $("sg-body");
+    body.innerHTML = sgs.map(function (sg, i) {
+      var applied = !!sg.applied;
+      return '<div class="sg-card' + (applied ? ' applied' : '') + '">' +
+        '<div class="sg-loc"><span class="sg-doc">' + esc(sg.docId) + '</span><span class="sg-line">第 ' + sg.line_no + ' 行</span>' +
+        (applied ? '<span class="sg-tag">已应用</span>' : '') + '</div>' +
+        '<div class="sg-row"><label>原文</label><div class="sg-orig">' + esc(sg.quote) + '</div></div>' +
+        '<div class="sg-row"><label>建议</label><div class="sg-new">' + esc(sg.replacement) + '</div></div>' +
+        '<div class="sg-reason">' + esc(sg.reason) + '</div>' +
+        '<div class="sg-actions">' +
+          '<button class="sg-btn" data-copy="' + i + '">复制建议</button>' +
+          '<button class="sg-btn sg-apply" data-apply="' + i + '"' + (applied ? ' disabled' : '') + '>' + (applied ? '已应用' : '应用到文书') + '</button>' +
+          '<button class="sg-btn sg-locate" data-locate="' + i + '">定位该行</button>' +
+        '</div></div>';
+    }).join("");
+    body.querySelectorAll("[data-copy]").forEach(function (el) {
+      el.onclick = function () { copyText(sgs[+el.getAttribute("data-copy")].replacement, el); };
+    });
+    body.querySelectorAll("[data-apply]").forEach(function (el) {
+      el.onclick = function () { applySuggestion(+el.getAttribute("data-apply")); };
+    });
+    body.querySelectorAll("[data-locate]").forEach(function (el) {
+      el.onclick = function () { locateSuggestion(+el.getAttribute("data-locate")); };
+    });
+  }
+
+  function applySuggestion(i) {
+    var b = curPatient.bill[curBillIdx];
+    var sg = b.ai.suggestions[i];
+    var doc = curPatient.emr[sg.docId];
+    if (!doc) return;
+    var line = null;
+    doc.lines.forEach(function (l) { if (l.no === sg.line_no) line = l; });
+    if (!line) { showToast("未找到目标行，请手动编辑"); return; }
+    var pos = line.text.indexOf(sg.quote);
+    if (pos < 0) { showToast("原文已变化，未找到可替换片段，请手动编辑"); return; }
+    line.text = line.text.slice(0, pos) + sg.replacement + line.text.slice(pos + sg.quote.length);
+    sg.applied = true;
+    markDirty(curPatient.id, sg.docId);
+    renderSuggestions(b);
+    renderDocument(false);
+    showToast("已应用建议，请点击「人工确认保存」写回");
+    setTimeout(function () {
+      var lineEl = document.querySelector('#drawer-doc .doc-line[data-no="' + sg.line_no + '"]');
+      if (lineEl) { lineEl.scrollIntoView({behavior: "smooth", block: "center"}); lineEl.classList.add("flash-line"); setTimeout(function () { lineEl.classList.remove("flash-line"); }, 1300); }
+    }, 80);
+  }
+
+  function locateSuggestion(i) {
+    var sg = curPatient.bill[curBillIdx].ai.suggestions[i];
+    curDrawer.docId = sg.docId;
+    renderDocument(false);
+    setTimeout(function () {
+      var lineEl = document.querySelector('#drawer-doc .doc-line[data-no="' + sg.line_no + '"]');
+      if (lineEl) { lineEl.scrollIntoView({behavior: "smooth", block: "center"}); lineEl.classList.add("flash-line"); setTimeout(function () { lineEl.classList.remove("flash-line"); }, 1300); }
+    }, 80);
+  }
+
+  function toggleEdit() {
+    editState.editing = !editState.editing;
+    var btn = $("edit-toggle");
+    if (btn) btn.textContent = editState.editing ? "完成编辑" : "编辑";
+    if (btn) btn.classList.toggle("active", editState.editing);
+    renderDocument(false);
+    if (editState.editing) showToast("编辑模式：点击正文即可修改，完成后点「人工确认保存」");
+  }
+
   $("patient-search").oninput = renderPatients;
   $("patient-filter").onchange = renderPatients;
   $("document-select").onchange = function () { curDrawer.docId = this.value; renderDocument(false); };
+  $("edit-toggle").onclick = toggleEdit;
+  $("save-btn").onclick = saveEdits;
+  $("sg-close").onclick = function () {
+    $("suggestion-panel").classList.add("collapsed");
+    $("sg-open-btn").classList.remove("hidden");
+  };
+  $("sg-open-btn").onclick = function () {
+    $("suggestion-panel").classList.remove("collapsed");
+    $("sg-open-btn").classList.add("hidden");
+  };
   $("tab-evidence").onclick = function () { switchTab("evidence"); };
   $("tab-reference").onclick = function () { switchTab("reference"); };
   $("drawer-close").onclick = closeDrawer;
