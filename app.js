@@ -18,6 +18,8 @@
   var curDrawer = { billIdx: null, eviIdx: null, docId: null, evidences: [], docEvs: [] };
   var edits = {};                     // patientId -> { docId: true } 记录未确认保存的修改
   var editState = { editing: false }; // 文书是否处于编辑态
+  var docSnapshots = {};              // patientId|docId -> { lineNo: text } 打开时的原文快照
+  var editHistory = [];               // 修改历史记录
   var $ = function (id) { return document.getElementById(id); };
 
   function esc(s) {
@@ -32,17 +34,18 @@
   function money(n) { return "￥" + Number(n || 0).toFixed(2); }
   function silverChip(s, adjusted) {
     var cls = s === "违规" ? "chip-red" : s === "存疑" ? "chip-amber" : s === "自费" ? "chip-blue" : "chip-green";
-    return '<span class="chip ' + cls + '">' + (adjusted ? '人工 · ' : '银海 · ') + esc(s) + '</span>';
+    var prefix = s === "已修复" ? "复核后" : (adjusted ? "人工 · " : "银海 · ");
+    return '<span class="chip ' + cls + '">' + prefix + ' · ' + esc(s) + '</span>';
   }
   function currentSilverStatus(p, idx) {
     return p._adjusted && p._adjusted[idx] ? p._adjusted[idx] : p.bill[idx].silver_status;
   }
   function aiChip(s) {
-    var cls = s === "有支持证据" ? "chip-red" : s === "有明确反证" ? "chip-green" : "chip-amber";
+    var cls = s === "有支持证据" ? "chip-red" : s === "有明确反证" ? "chip-green" : s === "已修复" ? "chip-green" : "chip-amber";
     return '<span class="chip ' + cls + '">' + esc(s) + '</span>';
   }
   function stateClass(s) {
-    return s === "有支持证据" ? "support" : s === "有明确反证" ? "contrary" : "unknown";
+    return s === "有支持证据" ? "support" : s === "有明确反证" ? "contrary" : s === "已修复" ? "contrary" : "unknown";
   }
   function roleName(role) {
     return {candidate: "候选证据", context: "关联事实", missing: "诊断区域", support: "反证定位", hit: "关键证据"}[role] || "证据";
@@ -119,7 +122,7 @@
     return DATA.patients.filter(function (p) {
       var text = [p.name, p.department, p.id, p.diagnoses.join(" ")].join(" ").toLowerCase();
       if (kw && text.indexOf(kw) < 0) return false;
-      if (filter === "通过") return p.bill.every(function (b) { return b.silver_status === "通过"; });
+      if (filter === "通过") return p.bill.every(function (b) { return b.silver_status === "通过" || b.silver_status === "已修复"; });
       if (filter !== "all") return p.bill.some(function (b) { return b.silver_status === filter; });
       return true;
     });
@@ -135,6 +138,7 @@
     list.forEach(function (p) {
       var nv = p.bill.filter(function (b) { return b.silver_status === "违规"; }).length;
       var nc = p.bill.filter(function (b) { return b.silver_status === "存疑"; }).length;
+      var nf = p.bill.filter(function (b) { return b.silver_status === "已修复"; }).length;
       var card = document.createElement("div");
       card.className = "patient-card" + (curPatient && curPatient.id === p.id ? " active" : "");
       card.setAttribute("data-id", p.id);
@@ -143,7 +147,8 @@
         '<div class="pc-diagnosis">' + esc(p.diagnoses.join("；")) + '</div>' +
         '<div class="pc-badges">' + (nv ? '<span class="mini-badge mini-red">违规 ' + nv + '</span>' : '') +
         (nc ? '<span class="mini-badge mini-amber">存疑 ' + nc + '</span>' : '') +
-        (!nv && !nc ? '<span class="mini-badge mini-green">全部通过</span>' : '') + '</div>';
+        (nf ? '<span class="mini-badge mini-green">已修复 ' + nf + '</span>' : '') +
+        (!nv && !nc && !nf ? '<span class="mini-badge mini-green">全部通过</span>' : '') + '</div>';
       card.onclick = function () { selectPatient(p); };
       box.appendChild(card);
     });
@@ -153,6 +158,7 @@
     curPatient = p;
     curBillIdx = null;
     closeDrawer();
+    snapshotPatient(p.id);
     renderPatients();
     $("crumb-dept").textContent = p.department || "未分科";
     $("crumb-id").textContent = p.id.toUpperCase();
@@ -166,14 +172,14 @@
   }
 
   function renderStats() {
-    var counts = {"违规": 0, "存疑": 0, "自费": 0, "通过": 0};
+    var counts = {"违规": 0, "存疑": 0, "自费": 0, "通过": 0, "已修复": 0};
     curPatient.bill.forEach(function (b, idx) {
       var status = currentSilverStatus(curPatient, idx);
       counts[status] = (counts[status] || 0) + 1;
     });
     var specs = [
       ["审核项目", curPatient.bill.length, "blue"], ["违规", counts["违规"], "red"],
-      ["存疑", counts["存疑"], "amber"], ["自费", counts["自费"], "blue"], ["通过", counts["通过"], "green"]
+      ["存疑", counts["存疑"], "amber"], ["已修复", counts["已修复"], "green"], ["通过", counts["通过"], "green"]
     ];
     $("patient-stats").innerHTML = specs.map(function (s) {
       return '<div class="stat-card ' + s[2] + '"><span>' + s[0] + '</span><b>' + s[1] + '</b></div>';
@@ -238,6 +244,7 @@
       return;
     }
     var ai = b.ai, state = ai.three_state;
+    var fixed = b.silver_status === "已修复";
     var conflict = (ai.references || []).filter(function (r) { return r.conflict; });
     var evidences = ai.evidences.map(function (ev, evi) {
       return '<article class="evidence-card" data-evi="' + evi + '" data-bill="' + idx + '">' +
@@ -251,8 +258,8 @@
       '<div class="clue-top"><span class="clue-id">证据复核</span><span class="clue-item">' + esc(b.item) + '</span>' +
       '<span class="amount">' + money(b.amount) + '</span>' + silverChip(b.silver_status) + '</div>' +
       '<div class="clue-body"><div class="ai-summary ' + stateClass(state) + '"><div class="ai-title">' + aiChip(state) +
-      '<span class="path-tag">' + esc(ai.path) + '路径 · 辅助复核，非最终结论</span></div>' +
-      '<div class="ai-explain">' + esc(ai.explanation) + '</div></div>' + basisInline(ai) +
+      '<span class="path-tag">' + (fixed ? '已修复 · 符合支付限定' : esc(ai.path) + '路径 · 辅助复核，非最终结论') + '</span></div>' +
+      '<div class="ai-explain">' + esc(fixed ? '问题已解决：相关病历已按要求修改，本线索复核通过。' : ai.explanation) + '</div></div>' + basisInline(ai) +
       (conflict.length ? '<div class="conflict"><b>审核口径差异 · 需医保办确认</b>' + esc(conflict[0].conflict) + '</div>' : '') +
       '<div class="evidence-head"><h3>病历证据与完整上下文（' + ai.evidences.length + '）</h3>' +
       (state === "无法确定" && ai.path === "语义" ? '<span class="candidate-label">' +
@@ -467,6 +474,38 @@
     }
   }
 
+  function snapshotPatient(pid) {
+    var p = DATA.patients.filter(function (x) { return x.id === pid; })[0];
+    if (!p) return;
+    Object.keys(p.emr).forEach(function (docId) {
+      var key = pid + "|" + docId;
+      if (docSnapshots[key]) return;
+      var snap = {};
+      p.emr[docId].lines.forEach(function (l) { snap[l.no] = l.text; });
+      docSnapshots[key] = snap;
+    });
+  }
+
+  function buildChanges(pid) {
+    var p = DATA.patients.filter(function (x) { return x.id === pid; })[0];
+    if (!p) return [];
+    var changes = [];
+    Object.keys(edits[pid] || {}).forEach(function (docId) {
+      if (!edits[pid][docId]) return;
+      var key = pid + "|" + docId;
+      var snap = docSnapshots[key];
+      var doc = p.emr[docId];
+      if (!doc) return;
+      doc.lines.forEach(function (l) {
+        var oldText = snap ? snap[l.no] : undefined;
+        if (oldText !== undefined && oldText !== l.text) {
+          changes.push({ docId: docId, docType: doc.type, lineNo: l.no, from: oldText, to: l.text });
+        }
+      });
+    });
+    return changes;
+  }
+
   function markDirty(pid, docId) {
     if (!edits[pid]) edits[pid] = {};
     edits[pid][docId] = true;
@@ -491,12 +530,105 @@
     var map = edits[curPatient.id] || {};
     var dirty = Object.keys(map).filter(function (k) { return map[k]; });
     if (!dirty.length) { showToast("暂无需要保存的修改"); return; }
+    var changes = buildChanges(curPatient.id);
     var names = dirty.map(function (did) {
       return curPatient.emr[did] ? curPatient.emr[did].type : did;
     });
+    // 记录修改历史
+    if (changes.length) {
+      editHistory.unshift({
+        time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
+        patientId: curPatient.id,
+        patientName: curPatient.name,
+        item: curBillIdx != null ? curPatient.bill[curBillIdx].item : "",
+        changes: changes,
+        result: "待判定"
+      });
+      updateHistoryBadge();
+    }
+    // 更新快照，使下次保存只记录新变化
+    dirty.forEach(function (docId) {
+      var key = curPatient.id + "|" + docId;
+      var snap = {};
+      var doc = curPatient.emr[docId];
+      if (doc) doc.lines.forEach(function (l) { snap[l.no] = l.text; });
+      docSnapshots[key] = snap;
+    });
     edits[curPatient.id] = {};
     updateSaveBar();
-    showToast("修改成功：已写回原始《" + names.join("》《") + "》");
+    showToast("已写回原始《" + names.join("》《") + "》，正在重新判定…");
+    setTimeout(function () { rejudge(curBillIdx); }, 900);
+  }
+
+  function rejudge(idx) {
+    if (idx == null || !curPatient) return;
+    var b = curPatient.bill[idx];
+    if (!b.ai || !b.ai.suggestions || !b.ai.suggestions.length) return;
+    var allFixed = b.ai.suggestions.every(function (sg) {
+      var doc = curPatient.emr[sg.docId];
+      if (!doc) return false;
+      var line = doc.lines.filter(function (l) { return l.no === sg.line_no; })[0];
+      if (!line) return false;
+      return line.text.indexOf(sg.replacement) >= 0;
+    });
+    var rec = editHistory[0];
+    if (allFixed) {
+      if (b.silver_status !== "已修复") {
+        b.silver_status = "已修复";
+        if (b.ai) b.ai.three_state = "已修复";
+        renderPatients();
+        renderStats();
+        renderClues();
+      }
+      if (rec) rec.result = "已修复";
+      showToast("✓ 重新判定完成：本线索已修复，符合支付限定");
+    } else {
+      if (rec) rec.result = "未修复";
+      showToast("重新判定：仍有待修改项，请继续完善");
+    }
+  }
+
+  function updateHistoryBadge() {
+    var badge = $("history-count");
+    if (badge) {
+      badge.textContent = editHistory.length;
+      badge.style.display = editHistory.length ? "inline-flex" : "none";
+    }
+  }
+
+  function renderHistory() {
+    var box = $("history-list");
+    if (!box) return;
+    if (!editHistory.length) {
+      box.innerHTML = '<div class="empty-evidence">暂无修改记录。对病历应用 AI 建议或手动编辑并保存后，这里会记录修改历史。</div>';
+      return;
+    }
+    box.innerHTML = editHistory.map(function (h) {
+      var resultCls = h.result === "已修复" ? "hist-fixed" : h.result === "未修复" ? "hist-unfixed" : "hist-pending";
+      var changes = h.changes.map(function (c) {
+        return '<div class="hist-change">' +
+          '<div class="hist-loc"><b>' + esc(c.docType) + '</b><span>第 ' + c.lineNo + ' 行</span></div>' +
+          '<div class="hist-diff"><div class="hist-from"><i>改前</i>' + esc(c.from) + '</div>' +
+          '<div class="hist-to"><i>改后</i>' + esc(c.to) + '</div></div>' +
+          '</div>';
+      }).join("");
+      return '<div class="hist-item">' +
+        '<div class="hist-top"><span class="hist-time">' + esc(h.time) + '</span>' +
+        '<span class="hist-patient">' + esc(h.patientName) + '</span>' +
+        '<span class="hist-item-name">' + esc(h.item) + '</span>' +
+        '<span class="hist-result ' + resultCls + '">' + esc(h.result) + '</span></div>' +
+        changes + '</div>';
+    }).join("");
+  }
+
+  function openHistory() {
+    renderHistory();
+    $("history-modal").classList.remove("hidden");
+    $("history-backdrop").classList.remove("hidden");
+  }
+  function closeHistory() {
+    $("history-modal").classList.add("hidden");
+    $("history-backdrop").classList.add("hidden");
   }
 
   function renderSuggestions(b) {
@@ -603,6 +735,7 @@
   document.onkeydown = function (e) {
     if (e.key !== "Escape") return;
     if (!$("help-modal").classList.contains("hidden")) { hideHelp(); return; }
+    if (!$("history-modal").classList.contains("hidden")) { closeHistory(); return; }
     if (!$("drawer").classList.contains("hidden")) closeDrawer();
   };
 
@@ -619,6 +752,9 @@
   $("help-close").onclick = hideHelp;
   $("help-start").onclick = hideHelp;
   $("help-backdrop").onclick = hideHelp;
+  $("history-btn").onclick = openHistory;
+  $("history-close").onclick = closeHistory;
+  $("history-backdrop").onclick = closeHistory;
   // 首次打开自动显示操作指引
   try {
     if (!localStorage.getItem("yb_help_seen")) {

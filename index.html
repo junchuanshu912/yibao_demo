@@ -17,6 +17,7 @@
   </div>
   <div class="hd-right">
     <button id="help-btn" class="help-btn" title="查看操作指引">? 操作指引</button>
+    <button id="history-btn" class="history-btn" title="查看修改记录">📝 修改记录 <span id="history-count" class="history-count"></span></button>
     <span class="env-pill">全合成演示数据</span>
     <span class="llm-pill" id="llm-status">离线预计算 · 无实时模型</span>
     <span class="hd-info" id="hd-info">—</span>
@@ -162,6 +163,20 @@
   </div>
   <div class="help-foot">
     <button id="help-start" class="help-start">开始体验</button>
+  </div>
+</div>
+
+<div class="history-backdrop hidden" id="history-backdrop"></div>
+<div class="history-modal hidden" id="history-modal" role="dialog" aria-label="修改记录">
+  <div class="history-head">
+    <div>
+      <div class="history-kicker">修改历史</div>
+      <div class="history-title">病历修改记录</div>
+    </div>
+    <button id="history-close" title="关闭">×</button>
+  </div>
+  <div class="history-body">
+    <div class="history-list" id="history-list"></div>
   </div>
 </div>
 
